@@ -115,6 +115,9 @@
 #include <zmq/zmqrpc.h>
 #endif
 
+using common::AmountErrMsg;
+using common::InvalidPortErrMsg;
+using common::ResolveErrMsg;
 using kernel::DumpMempool;
 using kernel::LoadMempool;
 using kernel::ValidationCacheSizes;
@@ -133,6 +136,9 @@ using node::NodeContext;
 using node::ShouldPersistMempool;
 using node::ImportBlocks;
 using node::VerifyLoadedChainstate;
+using util::Join;
+using util::ReplaceAll;
+using util::ToString;
 
 static constexpr bool DEFAULT_PROXYRANDOMIZE{true};
 static constexpr bool DEFAULT_REST_ENABLE{false};
@@ -403,7 +409,7 @@ static void HandleSIGHUP(int)
 static BOOL WINAPI consoleCtrlHandler(DWORD dwCtrlType)
 {
     if (!(*Assert(g_shutdown))()) {
-        LogPrintf("Error: failed to send shutdown signal on Ctrl-C\n");
+        LogError("Failed to send shutdown signal on Ctrl-C\n");
         return false;
     }
     Sleep(INFINITE);
@@ -598,7 +604,7 @@ void SetupServerArgs(ArgsManager& argsman)
 
     argsman.AddArg("-checkblocks=<n>", strprintf("How many blocks to check at startup (default: %u, 0 = all)", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checklevel=<n>", strprintf("How thorough the block verification of -checkblocks is: %s (0-4, default: %u)", Join(CHECKLEVEL_DOC, ", "), DEFAULT_CHECKLEVEL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures occasionally. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures every <n> operations. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkaddrman=<n>", strprintf("Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkpoints", strprintf("Enable rejection of any forks from the known historical chain until block %s (default: %u)", defaultChainParams->Checkpoints().GetHeight(), DEFAULT_CHECKPOINTS_ENABLED), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -834,7 +840,7 @@ std::set<BlockFilterType> g_enabled_filter_types;
     // Since LogPrintf may itself allocate memory, set the handler directly
     // to terminate first.
     std::set_new_handler(std::terminate);
-    LogPrintf("Error: Out of memory. Terminating.\n");
+    LogError("Out of memory. Terminating.\n");
 
     // The log was successful, terminate now.
     std::terminate();
@@ -1169,9 +1175,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     scheduler.scheduleEvery([&args, &node]{
         constexpr uint64_t min_disk_space = 50 << 20; // 50 MB
         if (!CheckDiskSpace(args.GetBlocksDirPath(), min_disk_space)) {
-            LogPrintf("Shutting down due to lack of disk space!\n");
+            LogError("Shutting down due to lack of disk space!\n");
             if (!(*Assert(node.shutdown))()) {
-                LogPrintf("Error: failed to send shutdown signal after disk space check\n");
+                LogError("Failed to send shutdown signal after disk space check\n");
             }
         }
     }, std::chrono::minutes{5});
@@ -1522,19 +1528,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (!result) {
         return InitError(util::ErrorString(result));
     }
-    mempool_opts.check_ratio = std::clamp<int>(mempool_opts.check_ratio, 0, 1'000'000);
-
-    int64_t descendant_limit_bytes = mempool_opts.limits.descendant_size_vbytes * 40;
-    if (mempool_opts.max_size_bytes < 0 || mempool_opts.max_size_bytes < descendant_limit_bytes) {
-        return InitError(strprintf(_("-maxmempool must be at least %d MB"), std::ceil(descendant_limit_bytes / 1'000'000.0)));
-    }
-    LogPrintf("* Using %.1f MiB for in-memory UTXO set (plus up to %.1f MiB of unused mempool space)\n", cache_sizes.coins * (1.0 / 1024 / 1024), mempool_opts.max_size_bytes * (1.0 / 1024 / 1024));
 
     bool do_reindex{args.GetBoolArg("-reindex", false)};
     const bool do_reindex_chainstate{args.GetBoolArg("-reindex-chainstate", false)};
 
     for (bool fLoaded = false; !fLoaded && !ShutdownRequested(node);) {
-        node.mempool = std::make_unique<CTxMemPool>(mempool_opts);
+        bilingual_str mempool_error;
+        node.mempool = std::make_unique<CTxMemPool>(mempool_opts, mempool_error);
+        if (!mempool_error.empty()) {
+            return InitError(mempool_error);
+        }
+        LogPrintf("* Using %.1f MiB for in-memory UTXO set (plus up to %.1f MiB of unused mempool space)\n", cache_sizes.coins * (1.0 / 1024 / 1024), mempool_opts.max_size_bytes * (1.0 / 1024 / 1024));
 
         node.chainman = std::make_unique<ChainstateManager>(*Assert(node.shutdown), chainman_opts, blockman_opts);
         ChainstateManager& chainman = *node.chainman;
@@ -1578,7 +1582,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             try {
                 return f();
             } catch (const std::exception& e) {
-                LogPrintf("%s\n", e.what());
+                LogError("%s\n", e.what());
                 return std::make_tuple(node::ChainstateLoadStatus::FAILURE, _("Error opening block database"));
             }
         };
@@ -1610,10 +1614,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                 if (fRet) {
                     do_reindex = true;
                     if (!Assert(node.shutdown)->reset()) {
-                        LogPrintf("Internal error: failed to reset shutdown signal.\n");
+                        LogError("Internal error: failed to reset shutdown signal.\n");
                     }
                 } else {
-                    LogPrintf("Aborted block database rebuild. Exiting.\n");
+                    LogError("Aborted block database rebuild. Exiting.\n");
                     return false;
                 }
             } else {
@@ -1748,7 +1752,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogPrintf("Stopping after block import\n");
             if (!(*Assert(node.shutdown))()) {
-                LogPrintf("Error: failed to send shutdown signal after finishing block import\n");
+                LogError("Failed to send shutdown signal after finishing block import\n");
             }
             return;
         }
