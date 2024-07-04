@@ -5193,7 +5193,7 @@ bool ChainstateManager::ShouldCheckBlockIndex() const
 {
     // Assert to verify Flatten() has been called.
     if (!*Assert(m_options.check_block_index)) return false;
-    if (GetRand(*m_options.check_block_index) >= 1) return false;
+    if (FastRandomContext().randrange(*m_options.check_block_index) >= 1) return false;
     return true;
 }
 
@@ -5681,7 +5681,8 @@ util::Result<void> ChainstateManager::ActivateSnapshot(
             return util::Error{strprintf(_("The base block header (%s) is part of an invalid chain."), base_blockhash.ToString())};
         }
 
-        if (Assert(m_active_chainstate->GetMempool())->size() > 0) {
+        auto mempool{m_active_chainstate->GetMempool()};
+        if (mempool && mempool->size() > 0) {
             return util::Error{_("Can't activate a snapshot when mempool not empty.")};
         }
     }
